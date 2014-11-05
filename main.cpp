@@ -20,6 +20,7 @@
  */
 
 #include "libcec/cec.h"
+#include "lib/xbmcclient.h"
 #include <cstdio>
 #include <fcntl.h>
 #include <iostream>
@@ -47,13 +48,15 @@ libcec_configuration configuration;
 string               port;
 bool                 aborted;
 bool                 daemonize;
-bool                 logEvents;                 
+bool                 logEvents;
 string               configFilePath;
 unsigned int         rpcPort;
 map<int, string>     keyMap;
+map<int, string>     eventMap;
 
 void populateKeyMapDefault()
 {
+  /* NOT USED */
   keyMap[CEC_USER_CONTROL_CODE_LEFT] = "{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"Input.Left\"}";
   keyMap[CEC_USER_CONTROL_CODE_RIGHT] = "{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"Input.Right\"}";
   keyMap[CEC_USER_CONTROL_CODE_DOWN] = "{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"Input.Down\"}";
@@ -67,14 +70,94 @@ void populateKeyMapDefault()
   keyMap[CEC_USER_CONTROL_CODE_BACKWARD] = "{\"jsonrpc\": \"2.0\", \"method\": \"Player.Seek\", \"params\": { \"playerid\": 1, \"value\": \"bigbackward\" }, \"id\": 1}";
   keyMap[CEC_USER_CONTROL_CODE_FAST_FORWARD] = "{\"jsonrpc\": \"2.0\", \"method\": \"Player.Seek\", \"params\": { \"playerid\": 1, \"value\": \"smallforward\" }, \"id\": 1}";
   keyMap[CEC_USER_CONTROL_CODE_FORWARD] = "{\"jsonrpc\": \"2.0\", \"method\": \"Player.Seek\", \"params\": { \"playerid\": 1, \"value\": \"bigforward\" }, \"id\": 1}";
+
+  /* USED */
+  keyMap[CEC_USER_CONTROL_CODE_CLEAR] = "{\"jsonrpc\": \"2.0\", \"method\": \"Input.Home\", \"id\": 1}";
+  keyMap[CEC_USER_CONTROL_CODE_ELECTRONIC_PROGRAM_GUIDE] = "{\"jsonrpc\": \"2.0\", \"method\": \"GUI.SetFullscreen\", \"params\": { \"name\": \"fullscreen\", \"value\": \"toggle\" }, \"id\": 1}";
+}
+
+void populateEventMapDefault()
+{
+  eventMap[CEC_USER_CONTROL_CODE_LEFT] = "left";
+  eventMap[CEC_USER_CONTROL_CODE_RIGHT] = "right";
+  eventMap[CEC_USER_CONTROL_CODE_DOWN] = "down";
+  eventMap[CEC_USER_CONTROL_CODE_UP] = "up";
+  eventMap[CEC_USER_CONTROL_CODE_SELECT] = "select";
+  eventMap[CEC_USER_CONTROL_CODE_EXIT] = "back";
+  eventMap[CEC_USER_CONTROL_CODE_PLAY] = "play";
+  eventMap[CEC_USER_CONTROL_CODE_STOP] = "stop";
+  eventMap[CEC_USER_CONTROL_CODE_PAUSE] = "pause";
+  eventMap[CEC_USER_CONTROL_CODE_REWIND] = "reverse";
+  eventMap[CEC_USER_CONTROL_CODE_BACKWARD] = "skipminus";
+  eventMap[CEC_USER_CONTROL_CODE_FAST_FORWARD] = "forward";
+  eventMap[CEC_USER_CONTROL_CODE_FORWARD] = "skipplus";
+  // eventMap[CEC_USER_CONTROL_CODE_F1_BLUE] = "blue";
+  eventMap[CEC_USER_CONTROL_CODE_F2_RED] = "red";
+  eventMap[CEC_USER_CONTROL_CODE_F3_GREEN] = "green";
+  eventMap[CEC_USER_CONTROL_CODE_F4_YELLOW] = "yellow";
+  eventMap[CEC_USER_CONTROL_CODE_SETUP_MENU] = "title";
+  eventMap[CEC_USER_CONTROL_CODE_ELECTRONIC_PROGRAM_GUIDE] = "backslash";
+
+  eventMap[CEC_USER_CONTROL_CODE_CHANNEL_UP] = "pageplus";
+  eventMap[CEC_USER_CONTROL_CODE_CHANNEL_DOWN] = "pageminus";
 }
 
 int CecKeyPressCB(void*, const cec_keypress key)
 {
-  if (key.duration == 0)
+  std::cout<<"Key press "<<key.keycode<<" " << key.duration<<std::endl;
+  if (key.duration == 0 || key.keycode == CEC_USER_CONTROL_CODE_STOP)
   {
     string json = "unmapped";
-    if (keyMap.find(key.keycode) != keyMap.end())
+
+    if (key.keycode == CEC_USER_CONTROL_CODE_VOLUME_UP)
+    {
+      system("pactl set-sink-volume 1 -- +10%");
+    }
+    else if (key.keycode == CEC_USER_CONTROL_CODE_VOLUME_DOWN)
+    {
+      system("pactl set-sink-volume 1 -- -10%");
+    }
+    else if (key.keycode == CEC_USER_CONTROL_CODE_MUTE)
+    {
+      system("pactl list sinks | grep -q Mute:.no && pactl set-sink-mute 1 1 || pactl set-sink-mute 1 0");
+    }
+    else if (key.keycode == CEC_USER_CONTROL_CODE_F1_BLUE)
+    {
+      system("returntodesktop.sh");
+    }
+    else if (eventMap.find(key.keycode) != eventMap.end())
+    {
+      /* connect to localhost, port 9777 using a UDP socket
+         this only needs to be done once.
+         by default this is where XBMC will be listening for incoming
+         connections. */
+      CAddress my_addr; // Address => localhost on 9777
+      int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+      if (sockfd < 0)
+      {
+        cout << "error creating socket" << endl;
+        return 1;
+      }
+
+      my_addr.Bind(sockfd);
+
+      if (key.keycode == CEC_USER_CONTROL_CODE_ELECTRONIC_PROGRAM_GUIDE) {
+        CPacketBUTTON btn1(eventMap[key.keycode].c_str(), "KB", BTN_DOWN | BTN_USE_NAME | BTN_QUEUE);
+        btn1.Send(sockfd, my_addr);
+
+        CPacketBUTTON btn2(eventMap[key.keycode].c_str(), "KB", BTN_UP | BTN_USE_NAME | BTN_QUEUE | BTN_NO_REPEAT);
+        btn2.Send(sockfd, my_addr);
+      }
+      else
+      {
+        CPacketBUTTON btn1(eventMap[key.keycode].c_str(), "R1", BTN_DOWN | BTN_USE_NAME | BTN_QUEUE);
+        btn1.Send(sockfd, my_addr);
+
+        CPacketBUTTON btn2(eventMap[key.keycode].c_str(), "R1", BTN_UP | BTN_USE_NAME | BTN_QUEUE | BTN_NO_REPEAT);
+        btn2.Send(sockfd, my_addr);
+      }
+    }
+    else if (keyMap.find(key.keycode) != keyMap.end())
     {
       json = keyMap[key.keycode];
 
@@ -97,9 +180,9 @@ int CecKeyPressCB(void*, const cec_keypress key)
         return 1;
       }
 
-      write(sockfd, json.c_str(), json.length());   
+      write(sockfd, json.c_str(), json.length());
       
-      shutdown(sockfd, SHUT_WR); 
+      shutdown(sockfd, SHUT_WR);
  
       close(sockfd);
     }
@@ -118,17 +201,17 @@ void sighandler(int iSignal)
 }
 
 void parseOptions(int argc, char* argv[])
-{  
+{
   stringstream ss;
   ss << argv[0];
   ss << " [-d] (daemonize) [-l] (log keypresses) [-f <path>] (path to config file) [-p <port>] (xbmc json-rpc port) [-h] (help)";
   string usage = ss.str();
-  
+
   for (int i = 1; i < argc; i++)
   {
-    if (strcmp(argv[i], "-d") == 0) 
+    if (strcmp(argv[i], "-d") == 0)
       daemonize = true;
-    else if (strcmp(argv[i], "-l") == 0) 
+    else if (strcmp(argv[i], "-l") == 0)
       logEvents = true;
     else if (strcmp(argv[i], "-f") == 0)
     {
@@ -215,7 +298,8 @@ int main (int argc, char* argv[])
   parseOptions(argc, argv);  
  
   populateKeyMapDefault();
-  
+  populateEventMapDefault();
+
   ifstream configFileStream(configFilePath.c_str());
   if (configFileStream) {
   
@@ -247,7 +331,7 @@ int main (int argc, char* argv[])
 #endif      
     setsid();
   }
-  
+
   if (signal(SIGINT, sighandler) == SIG_ERR)
   {
     cout << "can't register sighandler" << endl;
@@ -261,8 +345,9 @@ int main (int argc, char* argv[])
   configuration.bActivateSource = 0;
   callbacks.CBCecKeyPress = &CecKeyPressCB;
   configuration.callbacks = &callbacks;
-  
+
   configuration.deviceTypes.Add(CEC_DEVICE_TYPE_PLAYBACK_DEVICE);
+  configuration.deviceTypes.Add(CEC_DEVICE_TYPE_AUDIO_SYSTEM);
 
   ICECAdapter *parser = LibCecInitialise(&configuration);
   if (!parser)
@@ -301,7 +386,7 @@ int main (int argc, char* argv[])
     UnloadLibCec(parser);
     return 1;
   }
-  
+
   pause();
 
   parser->Close();
