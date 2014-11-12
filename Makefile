@@ -2,7 +2,7 @@ CC=g++
 CFLAGS=-Wall
 
 all: main.o
-	g++ -o cecanyway main.o -ldl
+	g++ -o cecanyway main.o -ldl -lpulse
 
 main.o: main.cpp
 	$(CC) -c main.cpp

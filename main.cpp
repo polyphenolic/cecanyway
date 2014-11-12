@@ -35,13 +35,197 @@
 #include <map>
 #include <stdlib.h>
 #include <unistd.h>
+#include <pulse/pulseaudio.h>
+#include <exception>
+#include <stdexcept>
 
 using namespace CEC;
 using namespace std;
 
 #define CEC_CONFIG_VERSION CEC_CLIENT_VERSION_CURRENT;
+#define HOST "127.0.0.1"
+#define DEFAULT_PORT 9090
 
 #include "libcec/cecloader.h"
+
+
+class pulseaudio {
+private:
+    pa_context *context;
+    pa_mainloop *mainloop;
+    pa_mainloop_api *mainloop_api;
+    bool success;
+    static const int SINK_INDEX = 1;
+    static const pa_volume_t MAX_VOLUME = PA_VOLUME_NORM * 2;
+    float volume_amount;
+    bool toggle_mute;
+    float result;
+    string error;
+
+
+    bool volume_relative_adjust(pa_cvolume *cv) {
+        /* Relative volume change is additive in case of a PERCENTAGE */
+        pa_volume_t v = pa_cvolume_avg(cv);
+        bool up = volume_amount >= 0;
+        if (!up)
+               volume_amount = -volume_amount;
+        pa_volume_t adjustment = (volume_amount * PA_VOLUME_NORM);
+        if (adjustment == 0) {
+            result = (float)v / PA_VOLUME_NORM;
+            return false;
+        } else {
+            if (up)
+                v = v+adjustment < PA_VOLUME_MUTED ? PA_VOLUME_MUTED : v + adjustment;
+            else
+                v = (int32_t)v-(int32_t)adjustment < PA_VOLUME_MUTED ? PA_VOLUME_MUTED : v - adjustment;
+            if (v > MAX_VOLUME)
+        up ? v = MAX_VOLUME : v = PA_VOLUME_MUTED;
+            pa_cvolume_set(cv, 1, v);
+            result = (float) v / PA_VOLUME_NORM;
+            return true;
+        }
+    }
+
+    static void context_drain_complete(pa_context *c, void *userdata) {
+        pa_context_disconnect(((pulseaudio *)userdata)->context);
+    }
+
+    void done_callback(pa_context *c, int success, void *userdata) {
+        pa_operation *o;
+        if (!success) {
+            error += "PulseAudio error: ";
+            error += pa_strerror(pa_context_errno(c));
+            return;
+        } else
+            this->success = true;
+
+        if (!(o = pa_context_drain(context, context_drain_complete, this)))
+            pa_context_disconnect(context);
+        else
+            pa_operation_unref(o);
+    }
+    static void static_done_callback(pa_context *c, int success, void *userdata) {
+        ((pulseaudio *)userdata)->done_callback(c, success, NULL);
+    }
+
+    void get_sink_volume_callback(pa_context *c, const pa_sink_info *i, int is_last, void *userdata) {
+
+        if (is_last < 0) {
+            error += "PulseAudio error Failed to get sink information: ";
+            error += pa_strerror(pa_context_errno(c));
+            return;
+        }
+        if (is_last)
+            return;
+        assert(i);
+        if (toggle_mute) {
+            result = !i->mute;
+            pa_operation_unref(pa_context_set_sink_mute_by_index(c, i->index, !i->mute, static_done_callback, this));
+        } else {
+            pa_cvolume cv = i->volume;
+            if (volume_relative_adjust(&cv))
+                // We changed the volume
+                pa_operation_unref(pa_context_set_sink_volume_by_index(c, i->index, &cv, static_done_callback, this));
+            else
+                // It remained the same
+                done_callback(c, 1, NULL);
+        }
+    }
+    static void static_get_sink_volume_callback(pa_context *c, const pa_sink_info *i, int is_last, void *userdata) {
+        ((pulseaudio *)userdata)->get_sink_volume_callback(c, i, is_last, NULL);
+    }
+
+    void cb_pulse_state(pa_context *c, void *userdata) {
+        assert(c);
+        switch (pa_context_get_state(c)) {
+
+        case PA_CONTEXT_READY:
+            // Do what we want here!!
+            pa_operation_unref(pa_context_get_sink_info_by_index(c, SINK_INDEX, static_get_sink_volume_callback, this));
+
+        break;
+        case PA_CONTEXT_FAILED:
+            error += "PulseAudio error Connection failure: ";
+            error += pa_strerror(pa_context_errno(c));
+        break;
+        case PA_CONTEXT_TERMINATED:
+            pa_mainloop_quit(mainloop, 0);
+        }
+    }
+    static void static_cb_pulse_state(pa_context *c, void *userdata) {
+        ((pulseaudio *)userdata)->cb_pulse_state(c, NULL);
+    }
+
+    void init_pulse() {
+        success = false;
+        if (!(mainloop = pa_mainloop_new())) {
+            throw runtime_error("Cannot create pulse mainloop");
+        }
+        mainloop_api = pa_mainloop_get_api(mainloop);
+        if (!(context = pa_context_new(mainloop_api, NULL))) {
+            throw runtime_error("Cannot start pulse mainloop");
+        }
+        pa_context_set_state_callback(context, static_cb_pulse_state, this);
+        if (pa_context_connect(context, NULL, PA_CONTEXT_NOFLAGS, NULL) < 0) {
+            throw runtime_error("pa_context_connect() failed");
+        }
+    }
+
+    void destroy_pulse() {
+        if (mainloop)
+            pa_mainloop_free(mainloop);
+        mainloop = NULL;
+        if (context)
+            pa_context_unref(context);
+        context = NULL;
+    }
+
+    void exectute_task() {
+        int ret;
+        error.clear();
+        result = -1.0;
+        init_pulse();
+        if (pa_mainloop_run(mainloop, &ret) < 0) {
+            throw runtime_error("pa_mainloop_run() failed.");
+        }
+        // Reset pulse
+        destroy_pulse();
+    }
+
+public:
+    pulseaudio(){
+        success = false;
+        volume_amount = 0.0;
+        toggle_mute = false;
+        mainloop = NULL;
+        context = NULL;
+        mainloop_api = NULL;
+    }
+
+    ~pulseaudio() {
+        destroy_pulse();
+    }
+
+    float modify_volume(float percent) {
+        volume_amount = percent;
+        exectute_task();
+        volume_amount = 0.0;
+        if (!error.empty()) {
+            throw runtime_error(error);
+        }
+        return result;
+    }
+
+    bool togglemute() {
+        toggle_mute = true;
+        exectute_task();
+        toggle_mute = false;
+        if (!error.empty()) {
+            throw runtime_error(error);
+        }
+        return result != 0.0;
+    }
+} pulse;
 
 ICECCallbacks        callbacks;
 libcec_configuration configuration;
@@ -50,7 +234,7 @@ bool                 aborted;
 bool                 daemonize;
 bool                 logEvents;
 string               configFilePath;
-unsigned int         rpcPort;
+unsigned int         rpcPort = DEFAULT_PORT;
 map<int, string>     keyMap;
 map<int, string>     eventMap;
 
@@ -101,9 +285,11 @@ void populateEventMapDefault()
   eventMap[CEC_USER_CONTROL_CODE_CHANNEL_UP] = "pageplus";
   eventMap[CEC_USER_CONTROL_CODE_CHANNEL_DOWN] = "pageminus";
 }
+void showxbmcalert(string title, string message, string image="", int displaytime=0);
 
 int CecKeyPressCB(void*, const cec_keypress key)
 {
+  try {
   std::cout<<"Key press "<<key.keycode<<" " << key.duration<<std::endl;
   if (key.duration == 0 || key.keycode == CEC_USER_CONTROL_CODE_STOP)
   {
@@ -111,15 +297,24 @@ int CecKeyPressCB(void*, const cec_keypress key)
 
     if (key.keycode == CEC_USER_CONTROL_CODE_VOLUME_UP)
     {
-      system("pactl set-sink-volume 1 -- +10%");
+        float vol = pulse.modify_volume(0.10);
+        stringstream ssvol;
+        ssvol<<"Volume "<<int(vol*100)<<"%";
+        showxbmcalert(ssvol.str(), "Volume increased", "VolumeIcon.png");
     }
     else if (key.keycode == CEC_USER_CONTROL_CODE_VOLUME_DOWN)
     {
-      system("pactl set-sink-volume 1 -- -10%");
+      float vol = pulse.modify_volume(-0.10);
+      stringstream ssvol;
+      ssvol<<"Volume "<<int(vol*100)<<"%";
+      showxbmcalert(ssvol.str(), "Volume decreased", "VolumeIcon.png");
     }
     else if (key.keycode == CEC_USER_CONTROL_CODE_MUTE)
     {
-      system("pactl list sinks | grep -q Mute:.no && pactl set-sink-mute 1 1 || pactl set-sink-mute 1 0");
+      bool mute = pulse.togglemute();
+      stringstream ssvol;
+      ssvol<<"Volume "<<int(pulse.modify_volume(0.0)*100)<<"%";
+      showxbmcalert(mute?"Volume Muted":"Volume Unmuted", ssvol.str(), "VolumeIcon.png");
     }
     else if (key.keycode == CEC_USER_CONTROL_CODE_F1_BLUE)
     {
@@ -156,6 +351,10 @@ int CecKeyPressCB(void*, const cec_keypress key)
         CPacketBUTTON btn2(eventMap[key.keycode].c_str(), "R1", BTN_UP | BTN_USE_NAME | BTN_QUEUE | BTN_NO_REPEAT);
         btn2.Send(sockfd, my_addr);
       }
+
+      shutdown(sockfd, SHUT_WR);
+      close(sockfd);
+
     }
     else if (keyMap.find(key.keycode) != keyMap.end())
     {
@@ -167,13 +366,13 @@ int CecKeyPressCB(void*, const cec_keypress key)
         cout << "error opening socket" << endl;
         return 1;
       }
-      
-      struct sockaddr_in serv_addr; 
-      memset(&serv_addr, '0', sizeof(serv_addr)); 
+
+      struct sockaddr_in serv_addr;
+      memset(&serv_addr, '0', sizeof(serv_addr));
       serv_addr.sin_family = AF_INET;
       inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr);
       serv_addr.sin_port = htons(rpcPort);
- 
+
       if (connect(sockfd, (struct sockaddr*) &serv_addr, sizeof(struct sockaddr_in)) < 0)
       {
         cout << "error connecting to 127.0.0.1:" << rpcPort << endl;
@@ -181,17 +380,58 @@ int CecKeyPressCB(void*, const cec_keypress key)
       }
 
       write(sockfd, json.c_str(), json.length());
-      
+
       shutdown(sockfd, SHUT_WR);
- 
+
       close(sockfd);
     }
-    
+
     if (logEvents)
       cout << "keycode: " << key.keycode << ", xbmc command: " << json << endl;
   }
-    
+  } catch (exception e) {
+     cerr<<"Error while handling keycode:"<<key.keycode<<" - "<<e.what()<<endl;
+  }
+
   return 0;
+}
+
+void showxbmcalert(string title, string message, string image, int displaytime) {
+    string json = "{\"jsonrpc\": \"2.0\", \"method\": \"GUI.ShowNotification\", \"params\": {";
+    json += "\"title\":\"" + title + "\"";
+    json += ",\"message\":\"" + message + "\"";
+    if (displaytime) {
+        json += ",\"displaytime:\"";
+        json += displaytime;
+    }
+    if (!image.empty()) {
+        json += ",\"image\":\"";
+        json += image;
+        json += "\"";
+    }
+
+    json += "}, \"id\": 1}";
+    cout<<json;
+
+    struct sockaddr_in serv_addr;
+    int sockfd = -1;
+    memset(&serv_addr, '0', sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    inet_pton(AF_INET, HOST, &serv_addr.sin_addr);
+    serv_addr.sin_port = htons(rpcPort);
+
+    if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
+        cout << "error opening socket:" << rpcPort << endl;
+        return;
+    }
+    if (connect(sockfd, (struct sockaddr*) &serv_addr, sizeof(struct sockaddr_in)) < 0)
+    {
+        cout << "error connecting to " HOST ":" << rpcPort << endl;
+        return;
+    }
+
+    write(sockfd, json.c_str(), json.length());
+    close(sockfd);
 }
 
 void sighandler(int iSignal)
@@ -251,7 +491,7 @@ void parseOptions(int argc, char* argv[])
 void populateKeyMapFromFile(ifstream &file)
 {
   stringstream ss;
-  
+
   bool error = false;
   int i = 1;
   while (file.good())
@@ -259,10 +499,10 @@ void populateKeyMapFromFile(ifstream &file)
     unsigned int keycode;
     string assignLiteral = "=>";
     string literal;
-    string json;  
-        
+    string json;
+
     if (!(file >> keycode))
-    {       
+    {
       if (!file.eof()) error = true;
       break;
     }
@@ -270,7 +510,7 @@ void populateKeyMapFromFile(ifstream &file)
     {
       error = true;
       break;
-    }       
+    }
     if (literal != assignLiteral)
     {
       error = true;
@@ -280,7 +520,7 @@ void populateKeyMapFromFile(ifstream &file)
     keyMap[keycode] = json;
     i++;
   }
-  
+
   if (error)
   {
     cout << "could not parse config file line #" << i << endl;
@@ -293,34 +533,35 @@ int main (int argc, char* argv[])
   daemonize = false;
   logEvents = false;
   configFilePath = "/etc/cecanyway.conf";
-  rpcPort = 9090;
-  
-  parseOptions(argc, argv);  
- 
+  parseOptions(argc, argv);
+
+  system("pactl set-source-output-volume 0 -- 100%");
+  system("pactl set-sink-input-volume 0 -- 100%");
+
   populateKeyMapDefault();
   populateEventMapDefault();
 
   ifstream configFileStream(configFilePath.c_str());
   if (configFileStream) {
-  
+
     populateKeyMapFromFile(configFileStream);
     configFileStream.close();
   }
- 
+
   if (daemonize)
   {
     pid_t pid;
-    if ((pid = fork()) < 0) 
+    if ((pid = fork()) < 0)
     {
       cout << "cannot fork" << endl;
       return 1;
-    } 
-    else if (pid != 0) 
-    { 
+    }
+    else if (pid != 0)
+    {
       // parent
       exit(0);
     }
-#ifndef __WINDOWS__    
+#ifndef __WINDOWS__
     // write pid file
     ofstream pidfile;
     pidfile.open("/var/run/cecanyway.pid");
@@ -328,7 +569,7 @@ int main (int argc, char* argv[])
     ss << getpid();
     pidfile << ss.str();
     pidfile.close();
-#endif      
+#endif
     setsid();
   }
 
